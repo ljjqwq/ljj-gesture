@@ -1,0 +1,85 @@
+# GMSL.yaml for YOLOv11 with OverLoCK_XT_Backbone, P2 Regenerator, MSMA-like Neck, and LSCD Head
+#
+# Parameters
+nc: 80  # number of classes (change as per your dataset)
+scales: # model compound scaling constants, (example, adapt if you use them)
+  # [depth, width, max_channels]
+  xt: [1.00, 1.00, 1024] # Example scale for XT, actual scaling factors for GMSL might differ
+
+# model definition
+# input_channels (ch) will be 3 for RGB images
+# Output channels for OverLoCK_XT_Backbone: P2':56, P3':112, P4':256, P5':336
+
+backbone:
+  # Layer 0: OverLoCK_XT_Backbone. Outputs a list: [P2', P3', P4', P5']
+  # Args for OverLoCK_XT_Backbone: [in_chans]
+  - [-1, 1, OverLoCK_XT_Backbone, [3]] # Output y[0] = list of 4 feature maps
+
+head:
+  # --- Feature Selectors from OverLoCK_XT_Backbone output (y[0]) ---
+  # Layer 1: Select P2' (56 channels)
+  - [0, 1, SelectItem, [0]]            # y[1] = P2' (raw)
+  # Layer 2: Select P3' (112 channels)
+  - [0, 1, SelectItem, [1]]            # y[2] = P3' (raw)
+  # Layer 3: Select P4' (256 channels)
+  - [0, 1, SelectItem, [2]]            # y[3] = P4' (raw)
+  # Layer 4: Select P5' (336 channels)
+  - [0, 1, SelectItem, [3]]            # y[4] = P5' (raw)
+
+  # --- P2 Feature Regenerator (as per paper 3.5.1) ---
+  # Input: P3' (y[2], 112 ch), P2' (y[1], 56 ch)
+  # Layer 5: Upsample P3'
+  - [2, 1, nn.Upsample, [None, 2, 'bilinear']] # y[5] = P3'_upsampled (112 ch)
+  # Layer 6: Channel adjust P3'_upsampled to 56 ch
+  - [-1, 1, Conv, [56, 1, 1]]               # y[6] = P3'_adjusted (56 ch)
+  # Layer 7: SEModule on adjusted P3'
+  - [-1, 1, SEModule, [56]]                  # y[7] = P3'_se (56 ch)
+  # Layer 8: Concat P2' (y[1]) and P3'_se (y[7])
+  - [[1, 7], 1, Concat, [1]]                 # y[8] = Concat_P2'_P3'se (56+56=112 ch)
+  # Layer 9: 1x1 Conv for fusion, output Regenerated_P2 (56 ch)
+  - [-1, 1, Conv, [56, 1, 1]]               # y[9] = Regenerated_P2 (56 ch)
+                                             # This is the input for MSMA's P2-path SPDConv
+
+  # --- MSMA-like Neck Structure ---
+  # Smallest feature branch (P3 detection output scale)
+  # Layer 10: SPDConv on Regenerated_P2 (y[9], 56 ch) -> output 128 ch (example)
+  - [9, 1, SPDConv, [128]]                   # y[10] = SPD_out_for_P2_path (128 ch)
+  # Layer 11: Upsample P4' (y[3], 256 ch) from OverLoCK
+  - [3, 1, nn.Upsample, [None, 2, 'nearest']]# y[11] = P4'_upsampled (256 ch)
+  # Layer 12: Concat for CSPOmniKernel input:
+  # SPD_out (y[10], 128ch), P4'_upsampled (y[11], 256ch), P3' (y[2], 112ch)
+  - [[10, 11, 2], 1, Concat, [1]]            # y[12] = Concat_for_CSPO (128+256+112 = 496 ch)
+  # Layer 13: CSPOmniKernel, output 256 ch (example for P3-level feature map)
+  # Ensure CSPOmniKernel [arg] matches its definition, e.g., [out_channels]
+  - [-1, 1, CSPOmniKernel, [256]]            # y[13] = CSPO_P3_features (256 ch)
+  # Layer 14: Further processing for P3 detection head output (e.g., C3k2 from yolo11-MSMA)
+  - [-1, 2, C3k2, [256, False]]              # y[14] = P3_detect_out (256 ch) -> To Detect_LSCD
+
+  # Medium feature branch (P4 detection output scale)
+  # Layer 15: Downsample P3_detect_out (y[14]) for P4 path
+  - [-1, 1, Conv, [256, 3, 2]]               # y[15] = P3_detect_down (256 ch)
+  # Layer 16: Concat with CSPO_P3_features (y[13]) or P4' (y[3])
+  # Using P4' (y[3]) for richer features from backbone might be better.
+  # Or use y[13] if MSMA structure implies reusing earlier neck features.
+  # Let's follow a structure similar to yolo11-MSMA.yaml where it concats with an earlier C3k2's output.
+  # Here, we concat y[15] (downsampled y[14]) and y[3] (P4' from OverLoCK)
+  - [[-1, 3], 1, Concat, [1]]                 # y[16] = Concat_P4_path (256 + 256 = 512 ch)
+  # Layer 17: Further processing for P4 detection head output
+  - [-1, 2, C3k2, [512, False]]              # y[17] = P4_detect_out (512 ch) -> To Detect_LSCD
+
+  # Large feature branch (P5 detection output scale)
+  # Layer 18: Downsample P4_detect_out (y[17]) for P5 path
+  - [-1, 1, Conv, [512, 3, 2]]               # y[18] = P4_detect_down (512 ch)
+  # Layer 19: Concat with P5' (y[4]) from OverLoCK
+  - [[-1, 4], 1, Concat, [1]]                 # y[19] = Concat_P5_path (512 + 336 = 848 ch)
+  # Layer 20: Further processing for P5 detection head output
+  - [-1, 2, C3k2, [1024, True]]             # y[20] = P5_detect_out (1024 ch) -> To Detect_LSCD
+
+  # --- Lightweight Shared Convolutional Detection Head (LSCD) ---
+  # Input layers for detection: y[14] (P3_out), y[17] (P4_out), y[20] (P5_out)
+  # Args for Detect_LSCD: [num_classes, other_LSCD_params...]
+  # Paper mentions [nc, 256] for yolo11-LSCD.yaml. '256' might be an internal channel size for LSCD.
+  # The input channels to Detect_LSCD are [256, 512, 1024] from y[14], y[17], y[20].
+  - [[14, 17, 20], 1, Detect_LSCD, [nc]] # Detect_LSCD will take num_classes.
+                                           # If LSCD needs other const args (like hidden_channels), add them.
+                                           # e.g., Detect_LSCD, [nc, 256] if 256 is a fixed param for LSCD.
